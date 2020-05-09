@@ -17,6 +17,7 @@ sudo apt install libraspberrypi-bin
 Get the `rpi-eeprom` script and put it where you want it(ex. /usr/local/bin/).
 ```
 cd /usr/local/bin/
+wget https://github.com/hazuki0x0/rpi-eeprom-ubuntu/raw/master/rpi-eeprom
 chmod +x ./rpi-eeprom
 ```
 
