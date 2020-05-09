@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+
+# ======= configures ========
+
+# Flag to check for ubuntu
+CHECK_DISTRIBUTION = True
+
+# Boot partition mount point
+BOOT_FS = '/boot/firmware'
+
+# Local repository path
+FIRMWARES_PATH = "/lib/firmware/raspberrypi-ubuntu"
+# ==== end of configures ====
+
+
+# ====== debug options ======
+# DO **NOT** CHANGE THIS OPTIONS IF YOU DON'T KNOW HOW IT WORKS
+HTTP_SIMULATION = False
+# BOOT_FS = 'fake-boot'
+# === end of debug options ==
+
+
+# ======== constants ========
+VERSION = "0.1"
+VERSION_INT = 1
+DEBUG_LEVEL_ERROR = 0
+DEBUG_LEVEL_WARNING = 1
+DEBUG_LEVEL_INFO = 2
+
+BOOTLOADER_FIRST_VERSION = 1557513636
+DEFAULT_CHANNEL = 'critical'
+DEFAULT_DEBUG = DEBUG_LEVEL_ERROR
+URL_FIRMWARE =  "https://api.github.com/repos/raspberrypi/rpi-eeprom/contents/firmware/"
+URL_RAW_FIRMWARE = "https://raw.githubusercontent.com/raspberrypi/rpi-eeprom/master/firmware/"
+
+API_REMAINING = "X-RateLimit-Remaining"
+
+BOOT_IMAGE_SIZE = 512 * 1024
+
+# config
+BOOT_MAX_BOOTCONF_SIZE = 2024
+# Each section starts with a magic number followed by a 32 bit offset to the
+# next section (big-endian).
+# The number, order and size of the sections depends on the bootloader version
+# but the following mask can be used to test for section headers and skip
+# unknown data.
+BOOT_MAGIC = 0x55aaf00f
+BOOT_MAGIC_MASK = 0xfffff00f
+BOOT_FILE_MAGIC = 0x55aaf11f # id for modifiable file, currently only bootconf.txt
+BOOT_FILE_HDR_LEN = 20
+BOOT_FILENAME_LEN = 12
+# ===== end of constants ====
+
+
+# =========== main program ===========
+import argparse
+import datetime
+import fnmatch
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from typing import Dict, List
+from urllib import request, error
+
+# ============= Utility =============
+FIRMWARE_BACKUP_DIR = os.path.join(FIRMWARES_PATH, 'backup')
+
+def getDebugLevelFile() -> str:
+    return os.path.join(FIRMWARES_PATH, 'debug_level')
+
+def getDebugLevel() -> int:
+    path = getDebugLevelFile()
+    if os.path.exists(path):
+        with open(path) as f:
+            return int(f.read())
+
+    return DEFAULT_DEBUG
+
+def setDebugLevel(level: int) -> None:
+    if not os.path.exists(FIRMWARES_PATH):
+        os.makedirs(FIRMWARES_PATH)
+
+    with open(getDebugLevelFile(), mode='w') as f:
+        f.write(str(level))
+
+def getContent(url: str):
+    req = request.Request(url)
+    try:
+        with request.urlopen(req) as response:
+            if getDebugLevel() >= DEBUG_LEVEL_INFO:
+                print("API Remaining: " + response.headers[API_REMAINING])
+
+            return response.read()
+    except error.HTTPError as e:
+        if e.code == 403:
+            if response.headers[API_REMAINING] == 0:
+                print("API limit\nPlease try again later...", file=sys.stderr)
+                sys.exit(1)
+        raise e
+
+def isNewerName(fwFile: str, newName: str) -> bool:
+    if fwFile == None:
+        return True
+
+    return fwFile < newName
+
+def removeQuery(query: str):
+    for p in glob.glob(query):
+        os.remove(p)
+
+def removeQueryIngoreCase(which, where='.'):
+    rule = re.compile(fnmatch.translate(which), re.IGNORECASE)
+    for name in os.listdir(where):
+        if rule.match(name):
+            os.remove(os.path.join(where, name))
+
+# calc git blob hash
+def calcBlobHash(path: str) -> str:
+    with open(path, mode='rb') as f:
+        binary = f.read()
+
+    data = b'blob ' + str(len(binary)).encode() + b'\0' + binary
+
+    return hashlib.sha1(data).hexdigest()
+
+def calcSigHash(path: str) -> str:
+    with open(path, mode='rb') as f:
+        return hashlib.sha256(f.read()).hexdigest() + '\n'
+
+def execCommand(commands: List[str]) -> str:
+    return subprocess.run(commands, encoding='utf-8', stdout=subprocess.PIPE).stdout
+
+def execShell(command: str) -> str:
+    return subprocess.run(command, encoding='utf-8', stdout=subprocess.PIPE, shell=True).stdout
+
+def makeTmpFile():
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    return path
+
+def safeRemoveFile(path: str):
+    if os.path.exists(path):
+        os.remove(path)
+
+# ============= Update =============
+def getFirmwareList(channel: str):
+    if HTTP_SIMULATION:
+        with open("http/" + channel) as f:
+            data = f.read()
+    else:
+        data = getContent(URL_FIRMWARE + channel)
+
+    return json.loads(data)
+
+def getFirmwareSet(channel: str) -> Dict[str, str]:
+    firmwares = {}
+    for item in getFirmwareList(channel):
+        name = item['name']
+        url = item['url']
+
+        if name.startswith('pieeprom'):
+            if isNewerName(firmwares.get('eeprom'), name):
+                firmwares['eeprom'] = name
+                firmwares['eeprom-hash'] = item['sha']
+        elif name.startswith('vl805'):
+            if isNewerName(firmwares.get('vl805'), name):
+                firmwares['vl805'] = name
+                firmwares['vl805-hash'] = item['sha']
+        elif name == 'recovery.bin':
+            firmwares['recovery'] = name
+            firmwares['recovery-hash'] = item['sha']
+
+    return firmwares
+
+def getBootloaderCurrentVersion() -> str:
+    bootloaderInfo = execCommand(['vcgencmd', 'bootloader_version'])
+    if 'timestamp' in bootloaderInfo:
+        result = re.findall(r'timestamp (\d+)', bootloaderInfo)
+        if len(result) == 0:
+            version = BOOTLOADER_FIRST_VERSION
+        else:
+            version = result[0]
+    else:
+        timeStamp = bootloaderInfo.split()[0]
+        version = execShell(f'date -u +%s --date "{timeStamp}" 2>/dev/null || true').strip()
+
+    if len(version) == 0:
+        version = BOOTLOADER_FIRST_VERSION
+
+    return version
+
+def getBootloaderVersion(path: str) -> str:
+    timeStamp = execShell(f'strings "{path}" | grep -F BUILD_TIMESTAMP').strip()
+    return timeStamp.split('=')[1]
+
+def getVL805CurrentVersion() -> str:
+    line = execShell('lspci -d 1106:3483 -xxx | grep -F 50:').strip().split(' ')
+    return line[4] + line[3] + line[2] + line[1]
+
+def getVL805Version(path: str) -> str:
+    return re.findall(r'vl805-([0-9a-f]+).bin', path)[0]
+
+def getFirmwareDirPath(channel: str) -> str:
+    return os.path.join(FIRMWARES_PATH, channel)
+
+def getFirmwarePath(channel: str, file: str) -> str:
+    return os.path.join(FIRMWARES_PATH, os.path.join(channel, file))
+
+def getRecoveryPath(channel: str) -> str:
+    return os.path.join(FIRMWARES_PATH, os.path.join(channel, 'recovery.bin'))
+
+def getUpdateInfoPath(channel: str) -> str:
+    return os.path.join(FIRMWARES_PATH, os.path.join(channel, 'update'))
+
+def checkFirmwares(channel: str):
+    firmwares = getFirmwareSet(channel)
+
+    channelPath = getFirmwareDirPath(channel)
+    if not os.path.exists(channelPath):
+        os.makedirs(channelPath)
+
+    eepromPath = getFirmwarePath(channel, firmwares['eeprom'])
+    vl805Path = getFirmwarePath(channel, firmwares['vl805'])
+    recoveryPath = getRecoveryPath(channel)
+
+    if not os.path.exists(eepromPath):
+        removeQuery(os.path.join(channelPath, "pieeprom-*"))
+        url = os.path.join(URL_RAW_FIRMWARE, os.path.join(channel, firmwares['eeprom']))
+        print("Download bootloader: " + url)
+        request.urlretrieve(url, eepromPath)
+        if calcBlobHash(eepromPath) != firmwares['eeprom-hash']:
+            print('The downloaded bootloader firmware is broken.\nPlease retry...', file=sys.stderr)
+            sys.exit(1)
+
+    if not os.path.exists(vl805Path):
+        removeQuery(os.path.join(channelPath, "vl805-*"))
+        url = os.path.join(URL_RAW_FIRMWARE, os.path.join(channel, firmwares['vl805']))
+        print("Download vl805 firmware: " + url)
+        request.urlretrieve(url, vl805Path)
+        if calcBlobHash(vl805Path) != firmwares['vl805-hash']:
+            print('The downloaded vl805 firmware is broken.\nPlease retry...', file=sys.stderr)
+            sys.exit(1)
+
+    if not os.path.exists(recoveryPath):
+        removeQuery(os.path.join(channelPath, "recovery.bin"))
+        url = os.path.join(URL_RAW_FIRMWARE, os.path.join(channel, firmwares['recovery']))
+        print("Download recovery: " + url)
+        request.urlretrieve(url, recoveryPath)
+        if calcBlobHash(recoveryPath) != firmwares['recovery-hash']:
+            print('The downloaded recovery file is broken.\nPlease retry...', file=sys.stderr)
+            sys.exit(1)
+    else:
+        recoveryHash = calcBlobHash(recoveryPath)
+        if recoveryHash != firmwares['recovery-hash']:
+            removeQuery(os.path.join(channelPath, "recovery.bin"))
+            url = os.path.join(URL_RAW_FIRMWARE, os.path.join(channel, firmwares['recovery']))
+            print("Download recovery: " + url)
+            request.urlretrieve(url, recoveryPath)
+            if calcBlobHash(recoveryPath) != firmwares['recovery-hash']:
+                print('The downloaded recovery file is broken.\nPlease retry...', file=sys.stderr)
+                sys.exit(1)
+
+    bootloaderCurrent = getBootloaderCurrentVersion()
+    bootloaderUpdate = getBootloaderVersion(eepromPath)
+    isBootloaderUpdate = int(bootloaderCurrent) < int(bootloaderUpdate)
+
+    vl805Current = getVL805CurrentVersion()
+    vl805Update = getVL805Version(vl805Path)
+    isVl805Update = int(vl805Current, 16) < int(vl805Update, 16)
+
+    if isBootloaderUpdate:
+        currentVerTime = datetime.datetime.fromtimestamp(int(bootloaderCurrent), datetime.timezone.utc)
+        updateVerTime = datetime.datetime.fromtimestamp(int(bootloaderUpdate), datetime.timezone.utc)
+        print('Bootloader update required')
+        print(f'Current version : {currentVerTime.strftime("%Y-%m-%d")}')
+        print(f'Latest version  : {updateVerTime.strftime("%Y-%m-%d")}\n')
+
+    if isVl805Update:
+        print('VL805 update required')
+        print(f'Current version : {vl805Current}')
+        print(f'Latest version  : {vl805Update}\n')
+
+    if not isBootloaderUpdate and not isVl805Update:
+        print('Firmwares are up to date.\n')
+
+    return {'eeprom': {'update': isBootloaderUpdate, 'file': firmwares['eeprom'], 'hash': firmwares['eeprom-hash']},
+            'vl805': {'update': isVl805Update, 'file': firmwares['vl805'], 'hash': firmwares['vl805-hash']},
+            'recovery': {'hash': firmwares['recovery-hash']}}
+
+# ============= Upgrade =============
+def getBootFilePath(fileName: str) -> str:
+    return os.path.join(BOOT_FS, fileName)
+
+def removePreviousUpdates():
+    # recovery
+    # Remove any stale recovery.bin files or EEPROM images
+    # N.B. recovery.bin is normally ignored by the ROM if is not a valid
+    # executable but it's best to not have the file at all.
+    safeRemoveFile(getBootFilePath('recovery.bin'))
+    removeQueryIngoreCase('recovery.[0-9][0-9][0-9]', BOOT_FS)
+
+    # eeprom
+    safeRemoveFile(getBootFilePath('pieeprom.bin'))
+    safeRemoveFile(getBootFilePath('pieeprom.upd'))
+    safeRemoveFile(getBootFilePath('pieeprom.sig'))
+
+    # vl805
+    safeRemoveFile(getBootFilePath('vl805.bin'))
+    safeRemoveFile(getBootFilePath('vl805.sig'))
+
+# A '.sig' file is created so that recovery.bin can check that the
+# EEPROM image has not been created (e.g. SD card corruption).
+# The .sig file format is currently just a SHA256 in ASCII hex. In future,
+# if an actual public key signature is required then that plus any other
+# data would be appended after the SHA256 signature.
+def applyUpgrade(channel: str, eepromPath: str = '', vl805Path: str = ''):
+    recoveryPath = getRecoveryPath(channel)
+
+    if len(eepromPath) != 0:
+        # If recovery.bin encounters pieeprom.upd then it will select it in
+        # preference to pieeprom.bin. The .upd file also causes recovery.bin
+        # to rename itself to recovery.000 and reboot if the update is successful.
+        # The rename causes the ROM to ignore this file and use the newly flashed
+        # EEPROM image instead.
+        with open(getBootFilePath('pieeprom.sig'), mode='w') as f:
+            f.write(calcSigHash(eepromPath))
+        shutil.copyfile(eepromPath, getBootFilePath('pieeprom.upd'))
+
+    if len(vl805Path) != 0:
+        with open(getBootFilePath('vl805.sig'), mode='w') as f:
+            f.write(calcSigHash(vl805Path))
+        shutil.copyfile(vl805Path, getBootFilePath('vl805.bin'))
+
+    shutil.copyfile(recoveryPath, getBootFilePath('recovery.bin'))
+
+def checkUpgrade(channel: str, update: Dict[str, Dict[str, str]]):
+    
+    if not update['eeprom']['update'] and not update['vl805']['update']:
+        print('No need to upgrade')
+        exit(0)
+    
+    hashError = False
+    eepromPath = getFirmwarePath(channel, update['eeprom']['file'])
+    vl805Path = getFirmwarePath(channel, update['vl805']['file'])
+    recoveryPath = getRecoveryPath(channel)
+
+    if calcBlobHash(eepromPath) != update['eeprom']['hash']:
+        hashError = True
+    if calcBlobHash(vl805Path) != update['vl805']['hash']:
+        hashError = True
+    if calcBlobHash(recoveryPath) != update['recovery']['hash']:
+        hashError = True
+
+    if hashError:
+        print('Firmware checksums failed - try rpi-eeprom update', file=sys.stderr)
+        exit(1)
+
+def checkDistribution():
+    if CHECK_DISTRIBUTION:
+        if not os.path.exists('/etc/os-release'):
+            print('/etc/os-release is not found. This distribution is not supported.', file=sys.stderr)
+            exit(1)
+        
+        dist = execShell('grep -iF Ubuntu /etc/os-release').split()
+        if len(dist) == 0:
+            raspbian = execShell('grep -iF Raspbian /etc/os-release').split()
+            if len(raspbian) != 0:
+                print('Raspbian is not supported. - use rpi-eeprom-update', file=sys.stderr)
+            else:
+                print('This distribution is not supported.', file=sys.stderr)
+            exit(1)
+
+    if not os.path.exists(BOOT_FS) or not os.path.isdir(BOOT_FS):
+        print(f'{BOOT_FS} is not found. This distribution is not supported.', file=sys.stderr)
+        print('Use rpi-eeprom-update if you use Raspbian.', file=sys.stderr)
+        exit(1)
+
+# ============= Config =============
+
+class BootloaderImage(object):
+    def __init__(self, filename):
+        self._filename = filename
+        self._bytes = bytearray(open(filename, 'rb').read())
+
+        if len(self._bytes) != BOOT_IMAGE_SIZE:
+            raise Exception("%s: Expected size %d bytes actual size %d bytes" %
+                            (filename, BOOT_IMAGE_SIZE, len(self._bytes)))
+
+    def find_config(self):
+        offset = 0
+        magic = 0
+        while offset < BOOT_IMAGE_SIZE:
+            magic, length = struct.unpack_from('>LL', self._bytes, offset)
+            if (magic & BOOT_MAGIC_MASK) != BOOT_MAGIC:
+                raise Exception('EEPROM is corrupted')
+
+            if magic == BOOT_FILE_MAGIC: # Found a file
+                name = self._bytes[offset + 8: offset + BOOT_FILE_HDR_LEN]
+                if name.decode('utf-8') == 'bootconf.txt':
+                    return (offset, length)
+
+            offset += 8 + length # length + type
+            offset = (offset + 7) & ~7
+
+        raise Exception('Bootloader config not found')
+
+    def writeToBoot(self, new_config: str) -> bytes:
+        hdr_offset, length = self.find_config()
+        new_config_bytes = new_config.encode()
+        new_len = len(new_config_bytes) + BOOT_FILENAME_LEN + 4
+        if len(new_config_bytes) > BOOT_MAX_BOOTCONF_SIZE:
+            raise Exception("Config is too large (%d bytes). The maximum size is %d bytes."
+                    % (len(new_config_bytes), BOOT_MAX_BOOTCONF_SIZE))
+        if hdr_offset + len(new_config_bytes) + BOOT_FILE_HDR_LEN > BOOT_IMAGE_SIZE:
+            raise Exception('EEPROM image size exceeded')
+
+        struct.pack_into('>L', self._bytes, hdr_offset + 4, new_len)
+        struct.pack_into(("%ds" % len(new_config_bytes)), self._bytes, hdr_offset + 4 + BOOT_FILE_HDR_LEN, new_config_bytes)
+
+        # If the new config is smaller than the old config then set any old
+        # data which is now unused to all ones (erase value)
+        pad_start = hdr_offset + 4 + BOOT_FILE_HDR_LEN + len(new_config_bytes)
+        pad = 0
+        while pad < (length - len(new_config_bytes)):
+            struct.pack_into('B', self._bytes, pad_start + pad, 0xff)
+            pad = pad + 1
+
+        return bytes(self._bytes)
+
+    def getBoot() -> bytes:
+        return bytes(self._bytes)
+
+    def readConfig(self) -> bytes:
+        hdr_offset, length = self.find_config()
+        offset = hdr_offset + 4 + BOOT_FILE_HDR_LEN
+        config_bytes = self._bytes[offset:offset+length-BOOT_FILENAME_LEN-4]
+
+        return bytes(config_bytes)
+
+def getBootloaderCurrentConfig():
+    return execCommand(['vcgencmd', 'bootloader_config'])
+
+def margeConfig(channel: str, update: Dict[str, Dict[str, str]]) -> bytes:
+    eepromPath = getFirmwarePath(channel, update['eeprom']['file'])
+    image = BootloaderImage(eepromPath)
+
+    backupFileName = f'pieeprom-backup-{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}.conf'
+    backupFilePath = os.path.join(FIRMWARE_BACKUP_DIR, backupFileName)
+
+    if not os.path.exists(FIRMWARE_BACKUP_DIR):
+        os.makedirs(FIRMWARE_BACKUP_DIR)
+
+    currentConfig = getBootloaderCurrentConfig()
+    # with open(backupFilePath, mode='w') as f:
+    #     f.write(currentConfig)
+
+    currentConfigSet = currentConfig.split()
+
+    newConfig = image.readConfig().decode()
+
+    for config in currentConfigSet:
+        pair = config.split('=')
+        if len(pair) <= 1:
+            continue
+
+        newConfig = re.sub(f'{pair[0]}=.*', config, newConfig)
+
+    if len(newConfig.split()) < 3:
+        # Don't propagate empty EEPROM config files and also prevent the initial
+        # bootloader config with WAKE_ON_GPIO=0 propgating to newer versions by
+        # accident.
+        return image.getBoot()
+
+    return image.writeToBoot(newConfig)
+
+def getChannelSettingFile() -> str:
+    return os.path.join(FIRMWARES_PATH, 'channel')
+
+def setChannelSetting(channel: str) -> None:
+    if not os.path.exists(FIRMWARES_PATH):
+        os.makedirs(FIRMWARES_PATH)
+
+    with open(getChannelSettingFile(), 'w') as f:
+        f.write(channel)
+
+def getChannelSetting() -> str:
+    file = getChannelSettingFile()
+    if os.path.exists(file):
+        with open(getChannelSettingFile()) as f:
+            return f.read()
+
+    return DEFAULT_CHANNEL
+
+# ==== common ====
+
+def checkRoot():
+    if os.geteuid() != 0 or os.getuid() != 0:
+        print('Must be run as root', file=sys.stderr)
+        exit(1)
+
+def checkDependencies():
+    checkRoot()
+
+    if subprocess.run(['which', 'vcgencmd'], stdout=subprocess.PIPE).returncode != 0:
+        print('\nCommand \'vcgencmd\' not found. - try\n', file=sys.stderr)
+        print('sudo add-apt-repository ppa:ubuntu-raspi2/ppa', file=sys.stderr)
+        print('sudo apt update', file=sys.stderr)
+        print('sudo apt install libraspberrypi-bin libraspberrypi-dev\n', file=sys.stderr)
+        exit(1)
+
+def commandUpdate(args: List[str]):
+    channel = getChannelSetting()
+
+    checkDependencies()
+    checkDistribution()
+
+    update = checkFirmwares(channel)
+    with open(getUpdateInfoPath(channel), 'w') as f:
+        json.dump(update, f)
+
+def commandUpgrade(args: List[str]):
+    channel = getChannelSetting()
+    updatePath = getUpdateInfoPath(channel)
+
+    if not os.path.exists(updatePath):
+        print('Run \'rpi-eeprom update\' first.', file=stderr)
+        exit(1)
+
+    with open(updatePath) as f:
+        update = json.load(f)
+
+    checkDependencies()
+    checkDistribution()
+    checkUpgrade(channel, update)
+    removePreviousUpdates()
+
+    print('Installing filmware updates...')
+
+    eeprom = ''
+    if update['eeprom']['update']:
+        eepromPath = getFirmwarePath(channel, update['eeprom']['file'])
+        print(f'Update bootloader    : {getBootloaderCurrentVersion()} -> {getBootloaderVersion(eepromPath)}')
+        eeprom = makeTmpFile()
+        with open(eeprom, mode='wb') as f:
+            f.write(margeConfig(channel, update))
+
+    vl805 = ''
+    if update['vl805']['update']:
+        vl805Path = getFirmwarePath(channel, update['vl805']['file'])
+        print(f'Update VL805 firmware: {getVL805CurrentVersion()} -> {getVL805Version(vl805Path)}')
+        vl805 = getFirmwarePath(channel, update['vl805']['file'])
+
+    applyUpgrade(channel, eeprom, vl805)
+
+    os.remove(eeprom)
+
+    print("EEPROM updates pending. Please reboot to apply the update.")
+
+def commandCleanBoot(args: List[str]):
+    checkDependencies()
+    checkDistribution()
+
+    removePreviousUpdates()
+
+def commandConfig(args):
+    done = False
+    if args.channel != None:
+        done = True
+        if args.channel == 'get':
+            print(f'Channel is {getChannelSetting()}')
+        else:
+            checkDependencies()
+            setChannelSetting(args.channel)
+            print(f'Set channel to {getChannelSetting()}')
+
+    if args.debug_level != None:
+        done = True
+        checkDependencies()
+        level = DEBUG_LEVEL_ERROR
+        if args.debug_level == 'warning':
+            level = DEBUG_LEVEL_WARNING
+        elif args.debug_level == 'info':
+            level = DEBUG_LEVEL_INFO
+        setDebugLevel(level)
+
+    if not done:
+        parser.parse_args(['config', '-h'])
+
+def commandUninstall(args):
+    checkRoot()
+    request = input('Are you sure you want to continue uninstall (yes/no)? ').lower()
+    while True:
+        if request == 'yes':
+            break
+        elif request == 'no':
+            return
+        else:
+            request = input("Please type 'yes' or 'no': ").lower()
+
+    removePreviousUpdates()
+    shutil.rmtree(FIRMWARES_PATH)
+    print('Done.')
+    print('Remove this script if you want:')
+    print(f'  sudo rm {__file__}')
+
+def main():
+    global parser
+    parser = argparse.ArgumentParser(description='Porting rpi-eeprom-update to Ubuntu\nManage firmwares update and apply update')
+    subparsers = parser.add_subparsers()
+
+    parser_update = subparsers.add_parser('update', help='Update local repository of available firmware')
+    parser_update.set_defaults(handler=commandUpdate)
+
+    parser_upgrade = subparsers.add_parser('upgrade', help='Upgrade the bootlader and/or VL805 USB controller firmware if need')
+    parser_upgrade.set_defaults(handler=commandUpgrade)
+
+    parser_cleanBoot = subparsers.add_parser('clean_boot', help='Clean up boot partition')
+    parser_cleanBoot.set_defaults(handler=commandCleanBoot)
+
+    parser_uninstall = subparsers.add_parser('uninstall_rpi_eeprom_files', help='Uninstall cached firmwares and cleanup')
+    parser_uninstall.set_defaults(handler=commandUninstall)
+
+    parser_config = subparsers.add_parser('config', help='Get and set options')
+    parser_config.set_defaults(handler=commandConfig)
+    parser_config.add_argument('--channel', choices=['critcal', 'stable', 'beta', 'get'], help='select \'Firmware release status\'(default \'critcal\') more infomation https://www.raspberrypi.org/documentation/hardware/raspberrypi/booteeprom.md')
+    parser_config.add_argument('--debug_level', choices=['error', 'warning', 'info'], help='Select debug print level')
+
+    parser.add_argument( '-v', '--version', help='show version', action='store_true')
+    
+    args = parser.parse_args()
+    if hasattr(args, 'handler'):
+        args.handler(args)
+    else:
+        if args.version:
+            print(f'rpi-eeprom version {VERSION}')
+        elif args.channel != None:
+            setChannelSetting(args.channel)
+            print(f'Set channel to {getChannelSetting()}')
+        else:
+            parser.print_help()
+
+if __name__ == '__main__':
+    main()
