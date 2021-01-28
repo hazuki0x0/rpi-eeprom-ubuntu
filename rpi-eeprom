@@ -539,6 +539,12 @@ def commandUpgrade(args):
     with open(updatePath) as f:
         update = json.load(f)
 
+    if useDefaultConfig or args.force_bootloader:
+        update['eeprom']['update'] = True
+
+    if args.force_vl805:
+        update['vl805']['update'] = True
+
     checkDependencies()
     checkDistribution()
     checkUpgrade(channel, update)
@@ -633,6 +639,8 @@ def main():
     parser_upgrade.set_defaults(handler=commandUpgrade)
     parser_upgrade.add_argument('-d', '--default_config', help='Use the default bootloader config', action='store_true')
     parser_upgrade.add_argument('-r', '--reboot', help='Auto reboot to apply the update after update ready', action='store_true')
+    parser_upgrade.add_argument('--force_bootloader', help='Force upgrade the bootloader', action='store_true')
+    parser_upgrade.add_argument('--force_vl805', help='Force upgrade of VL805 USB controller firmware', action='store_true')
 
     parser_cleanBoot = subparsers.add_parser('clean_boot', help='Clean up boot partition')
     parser_cleanBoot.set_defaults(handler=commandCleanBoot)
