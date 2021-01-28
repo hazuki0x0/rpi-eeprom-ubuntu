@@ -653,9 +653,6 @@ def main():
     else:
         if args.version:
             print(f'rpi-eeprom version {VERSION}')
-        elif args.channel != None:
-            setChannelSetting(args.channel)
-            print(f'Set channel to {getChannelSetting()}')
         else:
             parser.print_help()
 
