@@ -434,7 +434,7 @@ class BootloaderImage(object):
 
         return bytes(self._bytes)
 
-    def getBoot() -> bytes:
+    def getBoot(self) -> bytes:
         return bytes(self._bytes)
 
     def readConfig(self) -> bytes:
@@ -515,7 +515,7 @@ def checkDependencies():
         print('sudo apt install libraspberrypi-bin libraspberrypi-dev\n', file=sys.stderr)
         exit(1)
 
-def commandUpdate(args: List[str]):
+def commandUpdate(args):
     channel = getChannelSetting()
 
     checkDependencies()
@@ -525,12 +525,15 @@ def commandUpdate(args: List[str]):
     with open(getUpdateInfoPath(channel), 'w') as f:
         json.dump(update, f)
 
-def commandUpgrade(args: List[str]):
+def commandUpgrade(args):
+    useDefaultConfig = args.default_config
+    reboot = args.reboot
+
     channel = getChannelSetting()
     updatePath = getUpdateInfoPath(channel)
 
     if not os.path.exists(updatePath):
-        print('Run \'rpi-eeprom update\' first.', file=stderr)
+        print('Run \'rpi-eeprom update\' first.', file=sys.stderr)
         exit(1)
 
     with open(updatePath) as f:
@@ -548,8 +551,11 @@ def commandUpgrade(args: List[str]):
         eepromPath = getFirmwarePath(channel, update['eeprom']['file'])
         print(f'Update bootloader    : {getBootloaderCurrentVersion()} -> {getBootloaderVersion(eepromPath)}')
         eeprom = makeTmpFile()
-        with open(eeprom, mode='wb') as f:
-            f.write(margeConfig(channel, update))
+        if useDefaultConfig:
+            shutil.copyfile(eepromPath, eeprom)
+        else:
+            with open(eeprom, mode='wb') as f:
+                f.write(margeConfig(channel, update))
 
     vl805 = ''
     if update['vl805']['update']:
@@ -561,7 +567,12 @@ def commandUpgrade(args: List[str]):
 
     os.remove(eeprom)
 
-    print("EEPROM updates pending. Please reboot to apply the update.")
+    if reboot:
+        print('Update is ready.')
+        print('Reboot now...')
+        os.system('reboot')
+    else:
+        print("EEPROM updates pending. Please reboot to apply the update.")
 
 def commandCleanBoot(args: List[str]):
     checkDependencies()
@@ -620,6 +631,8 @@ def main():
 
     parser_upgrade = subparsers.add_parser('upgrade', help='Upgrade the bootlader and/or VL805 USB controller firmware if need')
     parser_upgrade.set_defaults(handler=commandUpgrade)
+    parser_upgrade.add_argument('-d', '--default_config', help='Use the default bootloader config', action='store_true')
+    parser_upgrade.add_argument('-r', '--reboot', help='Auto reboot to apply the update after update ready', action='store_true')
 
     parser_cleanBoot = subparsers.add_parser('clean_boot', help='Clean up boot partition')
     parser_cleanBoot.set_defaults(handler=commandCleanBoot)
