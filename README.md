@@ -32,6 +32,10 @@ Release note is [here](https://github.com/raspberrypi/rpi-eeprom/blob/master/fir
 ```
 sudo rpi-eeprom upgrade
 ```
+if you need to reset the bootloader_config,
+```
+sudo rpi-eeprom upgrade --default_config
+```
 #### Change firmware release status
 
 See also - [Firmware release status](https://www.raspberrypi.org/documentation/hardware/raspberrypi/booteeprom.md)
